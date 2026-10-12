@@ -2,10 +2,14 @@ import hashlib
 import html
 import json
 import os
+import re
 import smtplib
+import xml.etree.ElementTree as ET
+
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
@@ -24,8 +28,10 @@ IST = ZoneInfo("Asia/Kolkata")
 STATE_FILE = Path("seen_announcements.json")
 BASELINE_MARKER = Path("baseline_created.txt")
 
-BSE_PAGE_URL = "https://www.bseindia.com/corporates/ann.html"
-BSE_API_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
+BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml"
+BSE_ANNOUNCEMENTS_PAGE = (
+    "https://www.bseindia.com/corporates/ann.html"
+)
 
 HEADERS = {
     "User-Agent": (
@@ -33,36 +39,32 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/129.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
-    "Referer": BSE_PAGE_URL,
-    "Origin": "https://www.bseindia.com",
+    "Accept": (
+        "application/rss+xml, application/xml, text/xml, "
+        "text/html;q=0.9, */*;q=0.8"
+    ),
+    "Referer": "https://www.bseindia.com/",
 }
 
 
 # ---------------------------------------------------------
-# Utility functions
+# Text and state-file functions
 # ---------------------------------------------------------
 
 def clean_text(value):
     if value is None:
         return ""
 
+    text = html.unescape(str(value))
+
+    # Remove HTML tags that may appear in RSS descriptions.
+    text = re.sub(r"<[^>]+>", " ", text)
+
     return " ".join(
-        html.unescape(str(value))
-        .replace("\r", " ")
+        text.replace("\r", " ")
         .replace("\n", " ")
         .split()
     )
-
-
-def first_available(record, *field_names):
-    for field_name in field_names:
-        value = record.get(field_name)
-
-        if value not in (None, ""):
-            return clean_text(value)
-
-    return ""
 
 
 def load_seen_ids():
@@ -70,45 +72,43 @@ def load_seen_ids():
         return set()
 
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        stored_data = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
 
-        if isinstance(data, list):
-            return set(str(item) for item in data)
+        if isinstance(stored_data, list):
+            return {
+                str(item)
+                for item in stored_data
+            }
 
     except Exception as error:
-        print(f"Could not read state file: {error}")
+        print(f"Could not read the state file: {error}")
 
     return set()
 
 
 def save_seen_ids(seen_ids):
-    # Retain a reasonable history while keeping the repository file small.
-    recent_ids = sorted(seen_ids)[-2000:]
+    # Retain the most recent 2,000 identifiers.
+    stored_ids = sorted(seen_ids)[-2000:]
 
     STATE_FILE.write_text(
-        json.dumps(recent_ids, indent=2),
+        json.dumps(stored_ids, indent=2),
         encoding="utf-8"
     )
 
 
-def create_announcement_id(record):
-    existing_id = first_available(
-        record,
-        "NEWSID",
-        "NewsID",
-        "ANNOUNCEMENTID",
-        "AnnouncementId",
-        "AttachmentName"
-    )
+def create_item_id(item):
+    guid = clean_text(item.get("guid"))
 
-    if existing_id:
-        return existing_id
+    if guid:
+        return guid
 
     identifying_text = "|".join([
-        first_available(record, "SCRIP_CD", "Scrip_Code", "SLONGNAME"),
-        first_available(record, "NEWS_SUB", "HEADLINE", "SUBJECT"),
-        first_available(record, "DT_TM", "DissemDT", "NEWS_DT"),
-        first_available(record, "ATTACHMENTNAME", "AttachmentName"),
+        clean_text(item.get("title")),
+        clean_text(item.get("link")),
+        clean_text(item.get("published")),
+        clean_text(item.get("description")),
     ])
 
     return hashlib.sha256(
@@ -116,42 +116,30 @@ def create_announcement_id(record):
     ).hexdigest()
 
 
-def build_pdf_url(record):
-    direct_url = first_available(
-        record,
-        "NSURL",
-        "PDF_URL",
-        "ATTACHMENT_URL"
-    )
-
-    if direct_url.startswith("http"):
-        return direct_url
-
-    attachment = first_available(
-        record,
-        "ATTACHMENTNAME",
-        "AttachmentName"
-    )
-
-    if attachment:
-        return (
-            "https://www.bseindia.com/xml-data/"
-            "corpfiling/AttachLive/"
-            + attachment.lstrip("/")
-        )
-
-    return BSE_PAGE_URL
-
+# ---------------------------------------------------------
+# Email function
+# ---------------------------------------------------------
 
 def send_email(subject, body):
-    message = MIMEText(body, "plain", "utf-8")
+    message = MIMEText(
+        body,
+        "plain",
+        "utf-8"
+    )
 
     message["Subject"] = subject
     message["From"] = EMAIL_USER
     message["To"] = EMAIL_TO
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_USER, EMAIL_PASSWORD)
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465
+    ) as server:
+        server.login(
+            EMAIL_USER,
+            EMAIL_PASSWORD
+        )
+
         server.sendmail(
             EMAIL_USER,
             EMAIL_TO,
@@ -160,68 +148,93 @@ def send_email(subject, body):
 
 
 # ---------------------------------------------------------
-# BSE data retrieval
+# RSS retrieval and parsing
 # ---------------------------------------------------------
 
-def fetch_announcements():
-    today = datetime.now(IST).strftime("%Y%m%d")
+def element_text(element, tag_name):
+    child = element.find(tag_name)
 
-    params = {
-        "pageno": 1,
-        "strCat": -1,
-        "strPrevDate": today,
-        "strScrip": "",
-        "strSearch": "P",
-        "strToDate": today,
-        "strType": "C",
-    }
+    if child is None or child.text is None:
+        return ""
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    return clean_text(child.text)
 
-    # Establish the BSE session before requesting API data.
-    landing_response = session.get(
-        BSE_PAGE_URL,
+
+def fetch_rss_announcements():
+    response = requests.get(
+        BSE_RSS_URL,
+        headers=HEADERS,
         timeout=30
     )
-    landing_response.raise_for_status()
 
-    response = session.get(
-        BSE_API_URL,
-        params=params,
-        timeout=30
+    print(
+        "RSS response status: "
+        f"{response.status_code}"
     )
+
     response.raise_for_status()
 
-    payload = response.json()
+    root = ET.fromstring(response.content)
 
-    records = payload.get("Table", [])
+    announcements = []
 
-    if not isinstance(records, list):
-        raise RuntimeError(
-            "BSE API did not return the expected announcement list."
+    for item_element in root.findall(".//item"):
+        title = element_text(
+            item_element,
+            "title"
         )
 
-    print(f"Total BSE announcements received: {len(records)}")
+        description = element_text(
+            item_element,
+            "description"
+        )
 
-    return records
+        link = element_text(
+            item_element,
+            "link"
+        )
+
+        guid = element_text(
+            item_element,
+            "guid"
+        )
+
+        published = (
+            element_text(item_element, "pubDate")
+            or element_text(item_element, "date")
+        )
+
+        announcements.append({
+            "title": title,
+            "description": description,
+            "link": link,
+            "guid": guid,
+            "published": published,
+        })
+
+    print(
+        "Total RSS announcements received: "
+        f"{len(announcements)}"
+    )
+
+    if not announcements:
+        raise RuntimeError(
+            "The BSE RSS feed was reachable, but it "
+            "contained no announcement items."
+        )
+
+    return announcements
 
 
 # ---------------------------------------------------------
-# Filtering
+# Order-announcement filtering
 # ---------------------------------------------------------
 
-def is_order_announcement(record):
-    combined_text = " ".join(
-        clean_text(value).lower()
-        for value in record.values()
-        if isinstance(value, (str, int, float))
-    )
-
-    category_match = (
-        "company update" in combined_text
-        or "company_update" in combined_text
-    )
+def is_order_announcement(item):
+    searchable_text = " ".join([
+        clean_text(item.get("title")),
+        clean_text(item.get("description")),
+    ]).lower()
 
     order_phrases = [
         "award of order",
@@ -231,96 +244,83 @@ def is_order_announcement(record):
         "work order",
         "letter of award",
         "order received",
+        "received an order",
         "order win",
+        "order secured",
+        "contract award",
+        "awarded contract",
+        "purchase order",
     ]
 
-    order_match = any(
-        phrase in combined_text
+    return any(
+        phrase in searchable_text
         for phrase in order_phrases
     )
 
-    return category_match and order_match
 
+def extract_company_and_code(title):
+    cleaned_title = clean_text(title)
 
-def format_announcement(record):
-    company = first_available(
-        record,
-        "SLONGNAME",
-        "LONG_NAME",
-        "COMPANY_NAME",
-        "SCRIP_NAME"
-    ) or "Company name unavailable"
+    # Typical title:
+    # Company Ltd - 500000 - Announcement...
+    match = re.match(
+        r"^(.*?)\s*-\s*(\d{6})\s*-\s*(.*)$",
+        cleaned_title
+    )
 
-    security_code = first_available(
-        record,
-        "SCRIP_CD",
-        "Scrip_Code",
-        "SCRIPCODE"
-    ) or "Not available"
-
-    headline = first_available(
-        record,
-        "NEWS_SUB",
-        "HEADLINE",
-        "SUBJECT",
-        "NEWSSUB"
-    ) or "Award/Receipt of Order"
-
-    description = first_available(
-        record,
-        "MORE",
-        "DESCRIPTION",
-        "DETAILS",
-        "NEWS_BODY"
-    ) or "No additional description supplied."
-
-    received_time = first_available(
-        record,
-        "DT_TM",
-        "DissemDT",
-        "NEWS_DT",
-        "ReceivedTime"
-    ) or "Not available"
-
-    pdf_url = build_pdf_url(record)
+    if match:
+        return {
+            "company": clean_text(match.group(1)),
+            "security_code": match.group(2),
+            "headline": clean_text(match.group(3)),
+        }
 
     return {
-        "company": company,
-        "security_code": security_code,
-        "headline": headline,
-        "description": description,
-        "received_time": received_time,
-        "pdf_url": pdf_url,
+        "company": cleaned_title or "Company unavailable",
+        "security_code": "Not available",
+        "headline": cleaned_title or "Order announcement",
     }
 
 
+def normalize_link(link):
+    cleaned_link = clean_text(link)
+
+    if not cleaned_link:
+        return BSE_ANNOUNCEMENTS_PAGE
+
+    return urljoin(
+        "https://www.bseindia.com/",
+        cleaned_link
+    )
+
+
 # ---------------------------------------------------------
-# Main execution
+# Main process
 # ---------------------------------------------------------
 
 def main():
-    all_records = fetch_announcements()
+    all_announcements = fetch_rss_announcements()
 
-    matching_records = [
-        record
-        for record in all_records
-        if is_order_announcement(record)
+    matching_announcements = [
+        item
+        for item in all_announcements
+        if is_order_announcement(item)
     ]
 
     print(
-        "Matching Company Update / Order announcements: "
-        f"{len(matching_records)}"
+        "Matching order announcements: "
+        f"{len(matching_announcements)}"
     )
 
     current_ids = {
-        create_announcement_id(record)
-        for record in matching_records
+        create_item_id(item)
+        for item in matching_announcements
     }
 
     seen_ids = load_seen_ids()
 
-    # First production run:
-    # record existing announcements but do not email all old items.
+    # First successful production run:
+    # create a baseline but do not email existing announcements.
     if not BASELINE_MARKER.exists():
         seen_ids.update(current_ids)
         save_seen_ids(seen_ids)
@@ -331,72 +331,94 @@ def main():
         )
 
         print(
-            "Baseline created. Existing matching announcements "
-            "will not be emailed."
+            "Baseline created successfully. "
+            "Existing announcements were recorded "
+            "without sending emails."
         )
 
         return
 
-    new_records = [
-        record
-        for record in matching_records
-        if create_announcement_id(record) not in seen_ids
+    new_announcements = [
+        item
+        for item in matching_announcements
+        if create_item_id(item) not in seen_ids
     ]
 
-    if not new_records:
-        print("No new matching announcements were found.")
+    if not new_announcements:
+        print(
+            "No new matching order announcements found."
+        )
         return
 
-    # Send one email for each newly detected announcement.
-    for record in reversed(new_records):
-        details = format_announcement(record)
-
-        email_subject = (
-            "New BSE Order Alert: "
-            + details["company"]
+    # RSS feeds commonly list the newest entry first.
+    # Reverse the list so emails are sent oldest to newest.
+    for item in reversed(new_announcements):
+        title_details = extract_company_and_code(
+            item.get("title")
         )
 
-        email_body = f"""
+        description = clean_text(
+            item.get("description")
+        )
+
+        published = clean_text(
+            item.get("published")
+        ) or "Not available"
+
+        announcement_link = normalize_link(
+            item.get("link")
+        )
+
+        subject = (
+            "New BSE Order Alert: "
+            f"{title_details['company']}"
+        )
+
+        body = f"""
 NEW BSE ORDER ALERT
 
 Company:
-{details["company"]}
+{title_details["company"]}
 
 BSE Security Code:
-{details["security_code"]}
+{title_details["security_code"]}
 
 Announcement:
-{details["headline"]}
+{title_details["headline"]}
 
 Details:
-{details["description"]}
+{description or "No additional description supplied."}
 
-Exchange Received/Disseminated Time:
-{details["received_time"]}
+Published:
+{published}
 
-Announcement/PDF:
-{details["pdf_url"]}
+Announcement Link:
+{announcement_link}
 
-Source:
-{BSE_PAGE_URL}
+BSE Corporate Announcements:
+{BSE_ANNOUNCEMENTS_PAGE}
 
 Detected by the BSE Order Monitor.
-"""
+""".strip()
 
         send_email(
-            email_subject,
-            email_body.strip()
+            subject,
+            body
         )
 
-        announcement_id = create_announcement_id(record)
+        announcement_id = create_item_id(item)
         seen_ids.add(announcement_id)
 
         print(
-            "Alert sent for: "
-            + details["company"]
+            "Email alert sent for: "
+            f"{title_details['company']}"
         )
 
     save_seen_ids(seen_ids)
+
+    print(
+        "Announcement history updated successfully."
+    )
 
 
 if __name__ == "__main__":
