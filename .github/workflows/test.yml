@@ -1,34 +1,29 @@
 name: BSE Monitor
 
 on:
-  schedule:
-    - cron: "*/2 * * * *"
-
   workflow_dispatch:
 
 jobs:
-
   monitor:
-
     runs-on: ubuntu-latest
 
     steps:
+      - name: Download repository
+        uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           pip install -r requirements.txt
 
-      - name: Run Monitor
+      - name: Validate BSE access and send email
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-
         run: |
           python send_test_email.py
