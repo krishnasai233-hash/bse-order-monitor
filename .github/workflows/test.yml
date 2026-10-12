@@ -3,7 +3,6 @@ name: BSE Order Monitor
 on:
   schedule:
     - cron: "*/5 * * * *"
-
   workflow_dispatch:
 
 permissions:
@@ -40,7 +39,7 @@ jobs:
         run: |
           python send_test_email.py
 
-            - name: Save announcement history
+      - name: Save announcement history
         if: success()
         run: |
           git config user.name "github-actions[bot]"
