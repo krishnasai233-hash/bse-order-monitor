@@ -40,12 +40,19 @@ jobs:
         run: |
           python send_test_email.py
 
-      - name: Save announcement history
+            - name: Save announcement history
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add seen_announcements.json baseline_created.txt
+          if [ -f seen_announcements.json ]; then
+            git add seen_announcements.json
+          fi
+
+          if [ -f baseline_created.txt ]; then
+            git add baseline_created.txt
+          fi
 
           if git diff --cached --quiet; then
             echo "No announcement-state changes to save."
