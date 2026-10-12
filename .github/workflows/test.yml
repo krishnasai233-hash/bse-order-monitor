@@ -1,20 +1,30 @@
-name: Email Test
+name: BSE Monitor
 
 on:
+  schedule:
+    - cron: "*/2 * * * *"
+
   workflow_dispatch:
 
 jobs:
-  send-email:
+
+  monitor:
+
     runs-on: ubuntu-latest
 
     steps:
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Run Script
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Monitor
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
